@@ -1,0 +1,192 @@
+<meta charset="UTF-8">
+
+I work at Red Hat on <a href="https://gcc.gnu.org/">GCC, the GNU Compiler Collection</a>.
+
+<img class="aligncenter" src="https://developers.redhat.com/blog/wp-content/uploads/2014/09/gnu-logo.png" alt="GNU logo" />
+
+I've spent most of the last year making GCC easier to use, so I thought I'd write about some of the C and C++ improvements I've made that are in the next major release of GCC, <a href="https://gcc.gnu.org/gcc-9/changes.html">GCC 9</a>.
+
+<!--more-->
+
+
+<h2>A new look for diagnostics</h2>
+
+By way of example, let's look at how GCC 8 reports an attempt to use a missing binary "+" in C++.
+
+INVOKE_OLD_GCC t.cc
+
+Here's what it looks like in GCC 9:
+
+INVOKE_GCC t.cc
+
+There are a few changes here.   I've added a left-hand margin, showing line numbers.  The "error" line mentions line 15, but the expression in question spans multiple lines, and we're actually starting with line 14.  I think it's worth a little extra horizontal space to make it clear which line is which.  It also helps distinguish your source code from the annotations that GCC emits.  I believe they also make it a little easier to see where each diagnostic starts, by visually breaking things up at the leftmost column.
+
+Speaking of annotations, this example shows another new GCC 9 feature: diagnostics can label regions of the source code to show pertinent information.  Here, what's most important are the types of the left and right-hand sides of the "+" operator, so GCC highlights them inline.  Notice how the diagnostic also uses color to distinguish the two operands from each other, and the operator.
+
+The left margin affects how we print things like fix-it hints for missing header files:
+
+INVOKE_GCC -xc++ -c incomplete.c
+
+I've turned on these changes by default; they can be disabled via <a href="https://gcc.gnu.org/onlinedocs/gcc/Diagnostic-Message-Formatting-Options.html#index-fno-diagnostics-show-line-numbers">-fno-diagnostics-show-line-numbers</a> and <a href="https://gcc.gnu.org/onlinedocs/gcc/Diagnostic-Message-Formatting-Options.html#index-fno-diagnostics-show-labels">-fno-diagnostics-show-labels</a> respectively.
+
+Another example can be seen in the type-mismatch error from <a href="https://developers.redhat.com/blog/2018/03/15/gcc-8-usability-improvements/">my previous blog post</a>:
+
+INCLUDE_SOURCE param-type-mismatch.c
+
+where the bogus type of the expression is now highlighted inline:
+
+INVOKE_GCC -c param-type-mismatch.c
+
+Yet another example can be seen in this bad <code>printf</code> call:
+
+INVOKE_GPP -c bad-printf.cc -Wall
+
+which contrasts "inline" the type expected by the format string versus what was passed in.   (Embarrassingly, we didn't properly highlight format string locations in older versions of the C++ frontend - for GCC 9 I've implemented this so it has parity with that of the C frontend, as shown here).
+
+
+<h2>Not just for humans</h2>
+
+One concern I've heard when changing how GCC prints diagnostics is that it might break someone's script for parsing GCC output.  I don't think these changes will do that: most such scripts are set up to parse the
+
+<pre>
+  "FILENAME:LINE:COL: error: MESSAGE"
+</pre>
+
+lines and ignore the rest, and I'm not touching that part of the output.
+
+But it made me think it was about time we had a machine-readable output format for diagnostics, so for GCC 9 I've added a JSON output format: <a href="https://gcc.gnu.org/onlinedocs/gcc/Diagnostic-Message-Formatting-Options.html#index-fdiagnostics-format">-fdiagnostics-format=json</a>.
+
+Consider this warning:
+
+INVOKE_GCC -c cve-2014-1266.c -Wall
+
+With <code>-fdiagnostics-format=json</code> the diagnostics are emitted as a big blob of JSON to stderr.  Running them through the handy <code>python -m json.tool</code> to format them gives an idea of the structure:
+
+INVOKE_GCC_JSON -c cve-2014-1266.c -Wall -fdiagnostics-format=json
+
+In particular, the supplementary "note" is nested within the "warning" at the JSON level, allowing e.g. for IDEs to group them.  Some of our C++ diagnostics can have numerous child diagnostics giving additional detail, so being able to group them e.g. via a disclosure widget could be helpful.
+
+
+<h2>Simpler C++ errors</h2>
+C++ is a complicated language.  For example, the rules for figuring out which C++ function is to be invoked at a call site are <a href="https://en.cppreference.com/w/cpp/language/overload_resolution">non-trivial</a>.
+
+The compiler could need to consider several functions at a given call site, reject all of them for different reasons, and <code>g++</code>'s error messages have to cope with this generality, explaining why each was rejected.
+
+This generality can make the simple cases harder to read than they could be, so for GCC 9, I've added some special-casing to simplify some <code>g++</code> errors for common cases where there's just one candidate function.
+
+For example, GCC 8 could emit this:
+
+INVOKE_OLD_GPP param-type-mismatch.cc
+
+For GCC 9, I've special-cased this, giving a more direct error message, which highlights both the problematic argument, and the parameter that it can't be converted to:
+
+INVOKE_GPP param-type-mismatch.cc
+
+Similarly GCC 8 took two messages to offer suggestions for various kinds of misspelled name:
+
+INVOKE_OLD_GPP typo.cc
+
+so for GCC 9 I've consolidated the messages:
+
+INVOKE_GPP typo.cc
+
+In some cases, where GCC 8 knew to offer suggestions within namespaces:
+
+INVOKE_OLD_GPP typo-2.cc
+
+GCC 9 can now offer fix-it hints:
+
+INVOKE_GPP typo-2.cc
+
+
+<h2>Location location location</h2>
+
+A long-standing issue within GCC's internal representation is that not every node within the syntax tree has a source location.
+
+For GCC 8 I <a href="https://github.com/gcc-mirror/gcc/commit/d76863c8a62920c5a156125e68ad315b47bfcd24">added a way</a> to ensure that every argument at a C++ call site has a source location.
+
+For GCC 9 I've <a href="https://github.com/gcc-mirror/gcc/commit/d582d14011fec247f203a49e79bdab05f56197b0">extended this work</a> so that many more places in the C++ syntax tree now retain location information for longer.
+
+This really helps when tracking down bad initializations.  GCC 8 and earlier might unhelpfully emit errors on the final closing parenthesis or brace:
+
+INVOKE_OLD_GPP bad-inits.cc
+
+whereas now GCC 9 can highlight exactly where the various problems are:
+
+INVOKE_GPP bad-inits.cc
+
+
+<h2>What is the optimizer doing?</h2>
+
+GCC can automatically "vectorize" loops, reorganizing them to work on multiple iterations at once, to take advantage of the vector units on your CPU.  However it can only do this for some loops; if you stray from the path, GCC will have to use scalar code instead.
+
+Unfortunately, historically it hasn't been easy to get a sense from GCC about the decisions it's making as it's optimizing your code.  We have an option <a href="https://gcc.gnu.org/onlinedocs/gcc/Developer-Options.html#index-fopt-info">-fopt-info</a> which emits optimization information, but it's been more of a tool for the developers of GCC itself, rather than something aimed at end-users.
+
+For example, consider this (contrived) example:
+
+INCLUDE_SOURCE v.c
+
+I tried compiling it with GCC 8 with <code>-O3 -fopt-info-all-vec</code>, but it wasn't very enlightening:
+
+INVOKE_OLD_GCC -c v.c -O3 -fopt-info-all-vec
+
+For GCC 9, I've reorganized problem-tracking within the vectorizer so that the output is of the form:
+
+<pre>
+  [LOOP-LOCATION]: couldn't vectorize this loop
+  [PROBLEM-LOCATION]: because of [REASON]
+</pre>
+
+For the example above, this gives:
+
+INVOKE_GCC -c v.c -O3 -fopt-info-all-vec
+
+identifying the location of the construct within the loop that the vectorizer couldn't handle.   (I hoped to have it also show the source code, but that didn't make feature freeze).
+
+This improves things, but still has some limitations, so for GCC 9 I've also added a new option to emit machine-readable optimization information: <a href="https://gcc.gnu.org/onlinedocs/gcc/Developer-Options.html#index-fsave-optimization-record">-fsave-optimization-record</a>
+
+This writes out a <code>SRCFILE.opt-record.json.gz</code> file with much richer data: for example, every message is tagged with profile information (if available), so that you can look at the "hottest" part of the code, and it captures inlining information, so that if a function has been inlined into several places, you can see how each instance of the function has been optimized.
+
+
+<h2>Other improvements</h2>
+
+GCC can emit "fix-it hints" that suggest how to fix a problem in your code.  These can be automatically applied by an IDE.
+
+For GCC 9 I've added various new fix-it hints.  There are now fix-it hints for forgetting the <code>return *this;</code> needed by various C++ operators:
+
+INVOKE_GPP -c operator.cc
+
+for when the compiler needs a <code>typename</code>:
+
+INVOKE_GPP -c template.cc
+
+when trying to use an accessor member as if it were a data member:
+
+INVOKE_GPP -c fncall.cc
+
+for C++11's scoped enums:
+
+INVOKE_GPP -c enums.cc
+
+and a tweak to integrate the suggestions about misspelled members with that for accessors:
+
+INVOKE_GPP -c accessor-fixit.cc
+
+I've also tweaked the suggestions code so it considers transposed letters, so it should do a better job of figuring out misspellings.
+
+
+<h2>Looking to the future</h2>
+
+The above covers some of the changes I've made for GCC 9.
+
+Perhaps a deeper change is that we now have a set of <a href="https://gcc.gnu.org/onlinedocs/gccint/User-Experience-Guidelines.html">user experience guidelines for GCC</a>, to try to keep a focus on the programmer's experience as we implement new diagnostics.  If you'd like to get involved in GCC development, please join us on the <a href="https://gcc.gnu.org/lists.html">gcc mailing list</a> - hacking on diagnostics is a great way to get started.
+
+
+<h2>Trying it out</h2>
+
+GCC 9 will be in Fedora 30, which should be out in a few months.
+
+For simple code examples, you can play around with the new
+gcc at <a href="https://godbolt.org/">https://godbolt.org/</a> (select gcc "trunk").
+
+Have fun!
